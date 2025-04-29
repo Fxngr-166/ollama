@@ -15,12 +15,11 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ollama/ollama/auth"
-	"github.com/ollama/ollama/version"
+	"ollama.com/auth"
+	"ollama.com/version"
 )
 
 var (
@@ -47,7 +46,7 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 	query.Add("os", runtime.GOOS)
 	query.Add("arch", runtime.GOARCH)
 	query.Add("version", version.Version)
-	query.Add("ts", strconv.FormatInt(time.Now().Unix(), 10))
+	query.Add("ts", fmt.Sprintf("%d", time.Now().Unix()))
 
 	nonce, err := auth.NewNonce(rand.Reader, 16)
 	if err != nil {
@@ -79,7 +78,7 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent {
+	if resp.StatusCode == 204 {
 		slog.Debug("check update response 204 (current version is up to date)")
 		return false, updateResp
 	}
@@ -88,7 +87,7 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 		slog.Warn(fmt.Sprintf("failed to read body response: %s", err))
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		slog.Info(fmt.Sprintf("check update error %d - %.96s", resp.StatusCode, string(body)))
 		return false, updateResp
 	}
@@ -115,7 +114,7 @@ func DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
 	if err != nil {
 		return fmt.Errorf("error checking update: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
 	}
 	resp.Body.Close()

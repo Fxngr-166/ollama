@@ -4,9 +4,9 @@ package lifecycle
 
 import (
 	"context"
-	"errors"
+	"fmt"
 )
 
 func DoUpgrade(cancel context.CancelFunc, done chan int) error {
-	return errors.New("not implemented")
+	return fmt.Errorf("DoUpgrade not yet implemented")
 }

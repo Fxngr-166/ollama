@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ollama/ollama/api"
+	"ollama.com/api"
 )
 
 func startApp(ctx context.Context, client *api.Client) error {
@@ -31,7 +31,7 @@ func startApp(ctx context.Context, client *api.Client) error {
 			// Finally look in the path
 			appExe, err = exec.LookPath(AppName)
 			if err != nil {
-				return errors.New("could not locate ollama app")
+				return fmt.Errorf("could not locate ollama app")
 			}
 		}
 	}

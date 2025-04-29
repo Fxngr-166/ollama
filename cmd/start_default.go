@@ -4,11 +4,11 @@ package cmd
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
-	"github.com/ollama/ollama/api"
+	"ollama.com/api"
 )
 
 func startApp(ctx context.Context, client *api.Client) error {
-	return errors.New("could not connect to ollama server, run 'ollama serve' to start it")
+	return fmt.Errorf("could not connect to ollama server, run 'ollama serve' to start it")
 }

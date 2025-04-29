@@ -3,11 +3,11 @@
 package tray
 
 import (
-	"errors"
+	"fmt"
 
-	"github.com/ollama/ollama/app/tray/commontray"
+	"ollama.com/app/tray/commontray"
 )
 
 func InitPlatformTray(icon, updateIcon []byte) (commontray.OllamaTray, error) {
-	return nil, errors.New("not implemented")
+	return nil, fmt.Errorf("NOT IMPLEMENTED YET")
 }

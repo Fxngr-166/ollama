@@ -2,11 +2,11 @@
 
 ### Getting Started
 * [Quickstart](../README.md#quickstart)
-* [Examples](./examples.md)
+* [Examples](../examples)
 * [Importing models](./import.md)
 * [Linux Documentation](./linux.md)
 * [Windows Documentation](./windows.md)
-* [Docker Documentation](./docker.md)
+* [Docker Documentation](https://hub.docker.com/r/ollama/ollama)
 
 ### Reference
 

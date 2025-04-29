@@ -60,9 +60,7 @@ func humanTime(t time.Time, zeroValue string) string {
 	}
 
 	delta := time.Since(t)
-	if int(delta.Hours())/24/365 < -20 {
-		return "Forever"
-	} else if delta < 0 {
+	if delta < 0 {
 		return humanDuration(-delta) + " from now"
 	}
 

@@ -9,14 +9,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/ollama/ollama/app/store"
-	"github.com/ollama/ollama/app/tray"
-	"github.com/ollama/ollama/envconfig"
+	"ollama.com/app/store"
+	"ollama.com/app/tray"
 )
 
 func Run() {
 	InitLogging()
-	slog.Info("app config", "env", envconfig.Values())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var done chan int

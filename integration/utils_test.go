@@ -5,14 +5,13 @@ package integration
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,19 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ollama/ollama/api"
-	"github.com/ollama/ollama/app/lifecycle"
-	"github.com/ollama/ollama/format"
-	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
+	"ollama.com/api"
+	"ollama.com/app/lifecycle"
 )
-
-const (
-	smol = "llama3.2:1b"
-)
-
-func Init() {
-	lifecycle.InitLogging()
-}
 
 func FindPort() string {
 	port := 0
@@ -51,7 +41,7 @@ func FindPort() string {
 	return strconv.Itoa(port)
 }
 
-func GetTestEndpoint() (*api.Client, string) {
+func GetTestEndpoint() (string, string) {
 	defaultPort := "11434"
 	ollamaHost := os.Getenv("OLLAMA_HOST")
 
@@ -77,20 +67,16 @@ func GetTestEndpoint() (*api.Client, string) {
 		port = FindPort()
 	}
 
-	slog.Info("server connection", "host", host, "port", port)
-
-	return api.NewClient(
-		&url.URL{
-			Scheme: scheme,
-			Host:   net.JoinHostPort(host, port),
-		},
-		http.DefaultClient), fmt.Sprintf("%s:%s", host, port)
+	url := fmt.Sprintf("%s:%s", host, port)
+	slog.Info("server connection", "url", url)
+	return scheme, url
 }
 
+// TODO make fanicier, grab logs, etc.
 var serverMutex sync.Mutex
 var serverReady bool
 
-func startServer(t *testing.T, ctx context.Context, ollamaHost string) error {
+func StartServer(ctx context.Context, ollamaHost string) error {
 	// Make sure the server has been built
 	CLIName, err := filepath.Abs("../ollama")
 	if err != nil {
@@ -112,7 +98,7 @@ func startServer(t *testing.T, ctx context.Context, ollamaHost string) error {
 
 	if tmp := os.Getenv("OLLAMA_HOST"); tmp != ollamaHost {
 		slog.Info("setting env", "OLLAMA_HOST", ollamaHost)
-		t.Setenv("OLLAMA_HOST", ollamaHost)
+		os.Setenv("OLLAMA_HOST", ollamaHost)
 	}
 
 	slog.Info("starting server", "url", ollamaHost)
@@ -139,76 +125,67 @@ func startServer(t *testing.T, ctx context.Context, ollamaHost string) error {
 	return nil
 }
 
-func PullIfMissing(ctx context.Context, client *api.Client, modelName string) error {
+func PullIfMissing(ctx context.Context, client *http.Client, scheme, testEndpoint, modelName string) error {
 	slog.Info("checking status of model", "model", modelName)
 	showReq := &api.ShowRequest{Name: modelName}
-
-	showCtx, cancel := context.WithDeadlineCause(
-		ctx,
-		time.Now().Add(20*time.Second),
-		fmt.Errorf("show for existing model %s took too long", modelName),
-	)
-	defer cancel()
-	_, err := client.Show(showCtx, showReq)
-	var statusError api.StatusError
-	switch {
-	case errors.As(err, &statusError) && statusError.StatusCode == http.StatusNotFound:
-		break
-	case err != nil:
+	requestJSON, err := json.Marshal(showReq)
+	if err != nil {
 		return err
-	default:
+	}
+
+	req, err := http.NewRequest("POST", scheme+"://"+testEndpoint+"/api/show", bytes.NewReader(requestJSON))
+	if err != nil {
+		return err
+	}
+
+	// Make the request with the HTTP client
+	response, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == 200 {
 		slog.Info("model already present", "model", modelName)
 		return nil
 	}
-	slog.Info("model missing", "model", modelName)
+	slog.Info("model missing", "status", response.StatusCode)
 
-	stallDuration := 60 * time.Second // This includes checksum verification, which can take a while on larger models, and slower systems
-	stallTimer := time.NewTimer(stallDuration)
-	fn := func(resp api.ProgressResponse) error {
-		// fmt.Print(".")
-		if !stallTimer.Reset(stallDuration) {
-			return errors.New("stall was detected, aborting status reporting")
-		}
-		return nil
-	}
-
-	stream := true
 	pullReq := &api.PullRequest{Name: modelName, Stream: &stream}
-
-	var pullError error
-
-	done := make(chan int)
-	go func() {
-		pullError = client.Pull(ctx, pullReq, fn)
-		done <- 0
-	}()
-
-	select {
-	case <-stallTimer.C:
-		return errors.New("download stalled")
-	case <-done:
-		return pullError
+	requestJSON, err = json.Marshal(pullReq)
+	if err != nil {
+		return err
 	}
+
+	req, err = http.NewRequest("POST", scheme+"://"+testEndpoint+"/api/pull", bytes.NewReader(requestJSON))
+	if err != nil {
+		return err
+	}
+	slog.Info("pulling", "model", modelName)
+
+	response, err = client.Do(req.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		return fmt.Errorf("failed to pull model") // TODO more details perhaps
+	}
+	slog.Info("model pulled", "model", modelName)
+	return nil
 }
 
 var serverProcMutex sync.Mutex
 
-// Returns an Client, the testEndpoint, and a cleanup function, fails the test on errors
-// Starts the server if needed
-func InitServerConnection(ctx context.Context, t *testing.T) (*api.Client, string, func()) {
-	client, testEndpoint := GetTestEndpoint()
-	if os.Getenv("OLLAMA_TEST_EXISTING") == "" {
-		serverProcMutex.Lock()
-		fp, err := os.CreateTemp("", "ollama-server-*.log")
-		if err != nil {
-			t.Fatalf("failed to generate log file: %s", err)
-		}
-		lifecycle.ServerLogFile = fp.Name()
-		fp.Close()
-		require.NoError(t, startServer(t, ctx, testEndpoint))
-	}
+func GenerateTestHelper(ctx context.Context, t *testing.T, client *http.Client, genReq api.GenerateRequest, anyResp []string) {
 
-	return client, testEndpoint, func() {
+	// TODO maybe stuff in an init routine?
+	lifecycle.InitLogging()
+
+	requestJSON, err := json.Marshal(genReq)
+	if err != nil {
+		t.Fatalf("Error serializing request: %v", err)
+	}
+	defer func() {
 		if os.Getenv("OLLAMA_TEST_EXISTING") == "" {
 			defer serverProcMutex.Unlock()
 			if t.Failed() {
@@ -226,135 +203,63 @@ func InitServerConnection(ctx context.Context, t *testing.T) (*api.Client, strin
 				os.Stderr.Write(data)
 				slog.Warn("END OF SERVER")
 			}
-			err := os.Remove(lifecycle.ServerLogFile)
+			err = os.Remove(lifecycle.ServerLogFile)
 			if err != nil && !os.IsNotExist(err) {
 				slog.Warn("failed to cleanup", "logfile", lifecycle.ServerLogFile, "error", err)
 			}
 		}
-	}
-}
-
-func GenerateTestHelper(ctx context.Context, t *testing.T, genReq api.GenerateRequest, anyResp []string) {
-	client, _, cleanup := InitServerConnection(ctx, t)
-	defer cleanup()
-	require.NoError(t, PullIfMissing(ctx, client, genReq.Model))
-	DoGenerate(ctx, t, client, genReq, anyResp, 30*time.Second, 10*time.Second)
-}
-
-func DoGenerate(ctx context.Context, t *testing.T, client *api.Client, genReq api.GenerateRequest, anyResp []string, initialTimeout, streamTimeout time.Duration) {
-	stallTimer := time.NewTimer(initialTimeout)
-	var buf bytes.Buffer
-	fn := func(response api.GenerateResponse) error {
-		// fmt.Print(".")
-		buf.Write([]byte(response.Response))
-		if !stallTimer.Reset(streamTimeout) {
-			return errors.New("stall was detected while streaming response, aborting")
-		}
-		return nil
-	}
-
-	stream := true
-	genReq.Stream = &stream
-	done := make(chan int)
-	var genErr error
-	go func() {
-		genErr = client.Generate(ctx, &genReq, fn)
-		done <- 0
 	}()
+	scheme, testEndpoint := GetTestEndpoint()
 
-	select {
-	case <-stallTimer.C:
-		if buf.Len() == 0 {
-			t.Errorf("generate never started.  Timed out after :%s", initialTimeout.String())
-		} else {
-			t.Errorf("generate stalled.  Response so far:%s", buf.String())
+	if os.Getenv("OLLAMA_TEST_EXISTING") == "" {
+		serverProcMutex.Lock()
+		fp, err := os.CreateTemp("", "ollama-server-*.log")
+		if err != nil {
+			t.Fatalf("failed to generate log file: %s", err)
 		}
-	case <-done:
-		require.NoError(t, genErr, "failed with %s request prompt %s ", genReq.Model, genReq.Prompt)
-		// Verify the response contains the expected data
-		response := buf.String()
-		atLeastOne := false
-		for _, resp := range anyResp {
-			if strings.Contains(strings.ToLower(response), resp) {
-				atLeastOne = true
-				break
-			}
-		}
-		require.True(t, atLeastOne, "%s: none of %v found in %s", genReq.Model, anyResp, response)
-		slog.Info("test pass", "model", genReq.Model, "prompt", genReq.Prompt, "contains", anyResp, "response", response)
-	case <-ctx.Done():
-		t.Error("outer test context done while waiting for generate")
+		lifecycle.ServerLogFile = fp.Name()
+		fp.Close()
+		assert.NoError(t, StartServer(ctx, testEndpoint))
 	}
-}
 
-// Generate a set of requests
-// By default each request uses llama3.2 as the model
-func GenerateRequests() ([]api.GenerateRequest, [][]string) {
-	return []api.GenerateRequest{
-			{
-				Model:     smol,
-				Prompt:    "why is the ocean blue?",
-				Stream:    &stream,
-				KeepAlive: &api.Duration{Duration: 10 * time.Second},
-				Options: map[string]any{
-					"seed":        42,
-					"temperature": 0.0,
-				},
-			}, {
-				Model:     smol,
-				Prompt:    "why is the color of dirt brown?",
-				Stream:    &stream,
-				KeepAlive: &api.Duration{Duration: 10 * time.Second},
-				Options: map[string]any{
-					"seed":        42,
-					"temperature": 0.0,
-				},
-			}, {
-				Model:     smol,
-				Prompt:    "what is the origin of the us thanksgiving holiday?",
-				Stream:    &stream,
-				KeepAlive: &api.Duration{Duration: 10 * time.Second},
-				Options: map[string]any{
-					"seed":        42,
-					"temperature": 0.0,
-				},
-			}, {
-				Model:     smol,
-				Prompt:    "what is the origin of independence day?",
-				Stream:    &stream,
-				KeepAlive: &api.Duration{Duration: 10 * time.Second},
-				Options: map[string]any{
-					"seed":        42,
-					"temperature": 0.0,
-				},
-			}, {
-				Model:     smol,
-				Prompt:    "what is the composition of air?",
-				Stream:    &stream,
-				KeepAlive: &api.Duration{Duration: 10 * time.Second},
-				Options: map[string]any{
-					"seed":        42,
-					"temperature": 0.0,
-				},
-			},
-		},
-		[][]string{
-			{"sunlight"},
-			{"soil", "organic", "earth", "black", "tan"},
-			{"england", "english", "massachusetts", "pilgrims", "british"},
-			{"fourth", "july", "declaration", "independence"},
-			{"nitrogen", "oxygen", "carbon", "dioxide"},
-		}
-}
+	err = PullIfMissing(ctx, client, scheme, testEndpoint, genReq.Model)
+	if err != nil {
+		t.Fatalf("Error pulling model: %v", err)
+	}
 
-func skipUnderMinVRAM(t *testing.T, gb uint64) {
-	// TODO use info API in the future
-	if s := os.Getenv("OLLAMA_MAX_VRAM"); s != "" {
-		maxVram, err := strconv.ParseUint(s, 10, 64)
-		require.NoError(t, err)
-		// Don't hammer on small VRAM cards...
-		if maxVram < gb*format.GibiByte {
-			t.Skip("skipping with small VRAM to avoid timeouts")
+	// Make the request and get the response
+	req, err := http.NewRequest("POST", scheme+"://"+testEndpoint+"/api/generate", bytes.NewReader(requestJSON))
+	if err != nil {
+		t.Fatalf("Error creating request: %v", err)
+	}
+
+	// Set the content type for the request
+	req.Header.Set("Content-Type", "application/json")
+
+	// Make the request with the HTTP client
+	response, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("Error making request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	assert.NoError(t, err)
+	assert.Equal(t, response.StatusCode, 200, string(body))
+
+	// Verify the response is valid JSON
+	var payload api.GenerateResponse
+	err = json.Unmarshal(body, &payload)
+	if err != nil {
+		assert.NoError(t, err, body)
+	}
+
+	// Verify the response contains the expected data
+	atLeastOne := false
+	for _, resp := range anyResp {
+		if strings.Contains(strings.ToLower(payload.Response), resp) {
+			atLeastOne = true
+			break
 		}
 	}
+	assert.True(t, atLeastOne, "none of %v found in %s", anyResp, payload.Response)
 }

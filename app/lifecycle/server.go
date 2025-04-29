@@ -11,21 +11,15 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/ollama/ollama/api"
+	"ollama.com/api"
 )
 
 func getCLIFullPath(command string) string {
-	var cmdPath string
+	cmdPath := ""
 	appExe, err := os.Executable()
 	if err == nil {
-		// Check both the same location as the tray app, as well as ./bin
 		cmdPath = filepath.Join(filepath.Dir(appExe), command)
 		_, err := os.Stat(cmdPath)
-		if err == nil {
-			return cmdPath
-		}
-		cmdPath = filepath.Join(filepath.Dir(appExe), "bin", command)
-		_, err = os.Stat(cmdPath)
 		if err == nil {
 			return cmdPath
 		}
@@ -49,35 +43,37 @@ func getCLIFullPath(command string) string {
 	return command
 }
 
-func start(ctx context.Context, command string) (*exec.Cmd, error) {
+func SpawnServer(ctx context.Context, command string) (chan int, error) {
+	done := make(chan int)
+
+	logDir := filepath.Dir(ServerLogFile)
+	_, err := os.Stat(logDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			return done, fmt.Errorf("create ollama server log dir %s: %v", logDir, err)
+		}
+	}
+
 	cmd := getCmd(ctx, getCLIFullPath(command))
+	// send stdout and stderr to a file
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("failed to spawn server stdout pipe: %w", err)
+		return done, fmt.Errorf("failed to spawn server stdout pipe %s", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, fmt.Errorf("failed to spawn server stderr pipe: %w", err)
+		return done, fmt.Errorf("failed to spawn server stderr pipe %s", err)
 	}
-
-	rotateLogs(ServerLogFile)
-	logFile, err := os.OpenFile(ServerLogFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o755)
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create server log: %w", err)
+		return done, fmt.Errorf("failed to spawn server stdin pipe %s", err)
 	}
 
-	logDir := filepath.Dir(ServerLogFile)
-	_, err = os.Stat(logDir)
+	// TODO - rotation
+	logFile, err := os.OpenFile(ServerLogFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0755)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("stat ollama server log dir %s: %v", logDir, err)
-		}
-
-		if err := os.MkdirAll(logDir, 0o755); err != nil {
-			return nil, fmt.Errorf("create ollama server log dir %s: %v", logDir, err)
-		}
+		return done, fmt.Errorf("failed to create server log %w", err)
 	}
-
 	go func() {
 		defer logFile.Close()
 		io.Copy(logFile, stdout) //nolint:errcheck
@@ -121,33 +117,19 @@ func start(ctx context.Context, command string) (*exec.Cmd, error) {
 
 	// run the command and wait for it to finish
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start server %w", err)
+		return done, fmt.Errorf("failed to start server %w", err)
 	}
 	if cmd.Process != nil {
 		slog.Info(fmt.Sprintf("started ollama server with pid %d", cmd.Process.Pid))
 	}
 	slog.Info(fmt.Sprintf("ollama server logs %s", ServerLogFile))
 
-	return cmd, nil
-}
-
-func SpawnServer(ctx context.Context, command string) (chan int, error) {
-	done := make(chan int)
-
 	go func() {
 		// Keep the server running unless we're shuttind down the app
 		crashCount := 0
 		for {
-			slog.Info("starting server...")
-			cmd, err := start(ctx, command)
-			if err != nil {
-				crashCount++
-				slog.Error(fmt.Sprintf("failed to start server %s", err))
-				time.Sleep(500 * time.Millisecond * time.Duration(crashCount))
-				continue
-			}
-
 			cmd.Wait() //nolint:errcheck
+			stdin.Close()
 			var code int
 			if cmd.ProcessState != nil {
 				code = cmd.ProcessState.ExitCode()
@@ -161,12 +143,15 @@ func SpawnServer(ctx context.Context, command string) (chan int, error) {
 			default:
 				crashCount++
 				slog.Warn(fmt.Sprintf("server crash %d - exit code %d - respawning", crashCount, code))
-				time.Sleep(500 * time.Millisecond * time.Duration(crashCount))
-				break
+				time.Sleep(500 * time.Millisecond)
+				if err := cmd.Start(); err != nil {
+					slog.Error(fmt.Sprintf("failed to restart server %s", err))
+					// Keep trying, but back off if we keep failing
+					time.Sleep(time.Duration(crashCount) * time.Second)
+				}
 			}
 		}
 	}()
-
 	return done, nil
 }
 
